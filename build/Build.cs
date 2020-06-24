@@ -4,9 +4,16 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Text;
+using System.Threading;
+using JetBrains.Annotations;
+using Newtonsoft.Json.Linq;
 using Nuke.Common;
 using Nuke.Common.CI;
 using Nuke.Common.CI.AppVeyor;
@@ -108,6 +115,257 @@ partial class Build : NukeBuild
     const string ReleaseBranchPrefix = "release";
     const string HotfixBranchPrefix = "hotfix";
 
+    const int ServiceUnavailableRetryTimeout = 300;
+    const int WaitForCompletionRetryTimeout = 500;
+    const int WaitForCompletionTimeout = 300_000;
+    const int DefaultHttpClientTimeout = 100;
+    const int UploadAndDownloadRequestTimeout = 300;
+
+    static void SubmitSigningRequest(
+        string userToken,
+        string organizationId,
+        string artifactConfigurationId,
+        string signingPolicyId,
+        string projectKey,
+        string artifactConfigurationKey,
+        string signingPolicyKey,
+        string inputArtifactPath,
+        string description,
+        string apiUrl = "https://app.signpath.io/api/v1")
+    {
+        CreateAndUseAuthorizedHttpClient(userToken, DefaultHttpClientTimeout,
+            defaultHttpClient =>
+            {
+                CreateAndUseAuthorizedHttpClient(userToken, UploadAndDownloadRequestTimeout,
+                    uploadAndDownloadHttpClient =>
+                    {
+                        var outputArtifactPath =
+                            Path.ChangeExtension(
+                                inputArtifactPath,
+                                $".signed{Path.GetExtension(inputArtifactPath)}");
+                        var submitUrl = $"{apiUrl}/{organizationId}/SigningRequests";
+                        var getUrl = SubmitVia(
+                            uploadAndDownloadHttpClient,
+                            artifactConfigurationId,
+                            signingPolicyId,
+                            projectKey,
+                            artifactConfigurationKey,
+                            signingPolicyKey,
+                            description,
+                            inputArtifactPath,
+                            submitUrl);
+
+                        var downloadUrl = WaitForCompletion(
+                            defaultHttpClient,
+                            getUrl);
+                        DownloadArtifact(
+                            uploadAndDownloadHttpClient,
+                            downloadUrl,
+                            outputArtifactPath);
+                    });
+            });
+    }
+
+    static string TriggerViaWebhook(
+        string userToken,
+        string organizationId,
+        string projectKey,
+        string signingPolicyKey)
+    {
+        string uri = null;
+        // https://app.signpath.io/API/v1/<ORGANIZATION_ID>/Integrations/AppVeyor?ProjectKey=<PROJECT_KEY>&SigningPolicyKey=<SIGNING_POLICY_KEY>
+        CreateAndUseAuthorizedHttpClient(userToken, DefaultHttpClientTimeout, httpHandler =>
+        {
+            Console.WriteLine($"BuildVersion = {AppVeyor.Instance.BuildVersion}");
+            Console.WriteLine($"BuildId = {AppVeyor.Instance.BuildId}");
+            Console.WriteLine($"BuildNumber = {AppVeyor.Instance.BuildNumber}");
+            var response = httpHandler.PostAsync(
+                requestUri:
+                $"https://app.signpath.io/API/v1/{organizationId}/Integrations/AppVeyor?ProjectKey={projectKey}&SigningPolicyKey={signingPolicyKey}",
+                new StringContent(SerializationTasks
+                        .JsonSerialize(new
+                        {
+                            AppVeyor.Instance.AccountName,
+                            AppVeyor.Instance.ProjectSlug,
+                            AppVeyor.Instance.BuildVersion,
+                            AppVeyor.Instance.BuildId,
+                            AppVeyor.Instance.JobId
+                        }),
+                    Encoding.UTF8,
+                    "application/json")
+            ).GetAwaiter().GetResult();
+            Console.WriteLine(response.StatusCode);
+            Console.WriteLine(response.Content.ReadAsStringAsync().GetAwaiter().GetResult());
+            Assert(response.StatusCode == HttpStatusCode.Created,
+                "response.StatusCode == HttpStatusCode.Created");
+
+            uri = response.Headers.Location.AbsoluteUri;
+        });
+        return uri;
+    }
+
+    static void GetSignedArtifact(
+        string userToken,
+        string organizationId,
+        string signingRequestId,
+        string outputArtifactPath,
+        string apiUrl = "https://app.signpath.io/api/v1")
+    {
+        CreateAndUseAuthorizedHttpClient(userToken, DefaultHttpClientTimeout,
+            defaultHttpClient =>
+            {
+                CreateAndUseAuthorizedHttpClient(userToken, UploadAndDownloadRequestTimeout,
+                    uploadAndDownloadHttpClient =>
+                    {
+                        var expectedSigningRequestUrl = $"{apiUrl}/{organizationId}/SignRequests/{signingRequestId}";
+                        var downloadUrl = WaitForCompletion(
+                            defaultHttpClient,
+                            expectedSigningRequestUrl);
+                        DownloadArtifact(
+                            uploadAndDownloadHttpClient,
+                            downloadUrl,
+                            outputArtifactPath);
+                    });
+            });
+    }
+
+    static void CreateAndUseAuthorizedHttpClient(string userToken, int timeout, Action<HttpClient> action)
+    {
+        var previousProtocol = ServicePointManager.SecurityProtocol;
+        ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+        using var httpClient = new HttpClient
+        {
+            Timeout = TimeSpan.FromSeconds(timeout),
+            DefaultRequestHeaders =
+            {
+                Authorization = new AuthenticationHeaderValue("Bearer", userToken)
+            }
+        };
+        action.Invoke(httpClient);
+        ServicePointManager.SecurityProtocol = previousProtocol;
+    }
+
+    static string WaitForCompletion(HttpClient httpClient, string url)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        do
+        {
+            Console.WriteLine("checking status");
+            using var response = GetWithRetry(httpClient, url);
+            var result = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+            var jsonResult = SerializationTasks.JsonDeserialize<JObject>(result);
+            var status = jsonResult["status"].Value<string>();
+            Console.WriteLine(status);
+
+            switch (status)
+            {
+                case "Completed":
+                    return jsonResult["signedArtifactLink"].Value<string>();
+                case "Failed":
+                case "Denied":
+                case "Canceled":
+                    throw new Exception(status);
+            }
+
+            Thread.Sleep(WaitForCompletionRetryTimeout);
+        } while (stopwatch.ElapsedMilliseconds < WaitForCompletionTimeout);
+
+        throw new Exception("Operation timed out");
+    }
+
+    static HttpResponseMessage GetWithRetry(HttpClient httpClient, string url)
+    {
+        var response = SendWithRetry(
+            httpClient,
+            () => new HttpRequestMessage(HttpMethod.Get, url));
+        return response;
+    }
+
+    static HttpResponseMessage SendWithRetry(
+        HttpClient httpClient,
+        Func<HttpRequestMessage> action)
+    {
+        var retry = 0;
+        string reason = null;
+        while (true)
+        {
+            try
+            {
+                var request = action.Invoke();
+                var response = httpClient.SendAsync(request).GetAwaiter().GetResult();
+
+                if (response.StatusCode == HttpStatusCode.ServiceUnavailable)
+                    reason = "Temp unavailable";
+                else if (HttpStatusCode.InternalServerError <= response.StatusCode)
+                    reason = $"Unexpected status code {response.StatusCode}";
+                else
+                    return response;
+            }
+            catch (Exception e)
+            {
+                if (retry > 3)
+                    throw;
+                Thread.Sleep(ServiceUnavailableRetryTimeout);
+                retry++;
+            }
+        }
+    }
+
+    static void DownloadArtifact(
+        HttpClient httpClient,
+        string url,
+        string path)
+    {
+        using var response = GetWithRetry(httpClient, url);
+        Assert(response.StatusCode == HttpStatusCode.OK, $"{response.StatusCode} == HttpStatusCode.OK");
+
+        using var stream = response.Content.ReadAsStreamAsync().GetAwaiter().GetResult();
+        EnsureExistingParentDirectory(path);
+        using var fileStream = File.Open(path, FileMode.Create);
+        stream.CopyToAsync(fileStream).GetAwaiter().GetResult();
+    }
+
+    static string SubmitVia(HttpClient httpClient,
+        [CanBeNull] string artifactConfigurationId,
+        [CanBeNull] string signingPolicyId,
+        [CanBeNull] string projectKey,
+        [CanBeNull] string artifactConfigurationKey,
+        [CanBeNull] string signingPolicyKey,
+        string description,
+        string inputArtifact,
+        string url)
+    {
+        HttpRequestMessage Factory()
+        {
+            var content = new MultipartFormDataContent();
+            var data = new[]
+                {
+                    ("ArtifactConfigurationId", artifactConfigurationId),
+                    ("SigningPolicyId", signingPolicyId),
+                    ("ProjectKey", projectKey),
+                    ("ArtifactConfigurationKey", artifactConfigurationKey),
+                    ("SigningPolicyKey", signingPolicyKey),
+                    ("Description", description)
+                }
+                .Where(x => x.Item2 != null).ToList();
+            data.ForEach(x => content.Add(new StringContent(x.Item2), x.Item1));
+
+            var fileStream = new FileStream(inputArtifact, FileMode.Open);
+            var streamContent = new StreamContent(fileStream);
+            streamContent.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+            content.Add(streamContent, "Artifact", inputArtifact);
+
+            var request = new HttpRequestMessage(HttpMethod.Post, url) {Content = content};
+            return request;
+        }
+
+        var response = SendWithRetry(httpClient, Factory);
+        ControlFlow.Assert(response.StatusCode == HttpStatusCode.Created,
+            $"{response.StatusCode} == HttpStatusCode.OK");
+
+        return response.Headers.Location.AbsoluteUri;
+    }
+
     Target Clean => _ => _
         .Before(Restore)
         .Executes(() =>
@@ -117,8 +375,10 @@ partial class Build : NukeBuild
         });
 
     [Parameter] bool IgnoreFailedSources;
+    [Parameter] string SignPathApiToken;
 
     Target Restore => _ => _
+        .Requires(() => SignPathApiToken)
         .Executes(() =>
         {
             DotNetRestore(_ => _
@@ -177,6 +437,29 @@ partial class Build : NukeBuild
                 .SetOutputDirectory(PackageDirectory)
                 .SetVersion(GitVersion.NuGetVersionV2)
                 .SetPackageReleaseNotes(GetNuGetReleaseNotes(ChangelogFile, GitRepository)));
+
+            var packagesZip = OutputDirectory / "packages.zip";
+            CompressZip(PackageDirectory, packagesZip);
+            AppVeyor.Instance.PushArtifact(packagesZip);
+            
+            // PackageFiles.ForEach(x => AppVeyor.Instance.PushArtifact(x));
+            var organizationId = "09e500c8-00f7-4f3b-95f6-e33f77e67410";
+            var uri = TriggerViaWebhook(
+                userToken: SignPathApiToken,
+                organizationId: organizationId,
+                projectKey: "nuke",
+                signingPolicyKey: "test-signing");
+
+            CreateAndUseAuthorizedHttpClient(
+                SignPathApiToken,
+                DefaultHttpClientTimeout,
+                httpClient =>
+                {
+                    var downloadUrl = WaitForCompletion(httpClient, uri);
+                    DownloadArtifact(httpClient, downloadUrl, PackageDirectory / "packages.signed.zip");
+                    AppVeyor.Instance.PushArtifact(PackageDirectory / "packages.signed.zip");
+                    Console.WriteLine(downloadUrl);
+                });
         });
 
     [Partition(2)] readonly Partition TestPartition;
@@ -272,7 +555,7 @@ partial class Build : NukeBuild
                         GitRepository.Branch.StartsWithOrdinalIgnoreCase(HotfixBranchPrefix))
         .Executes(() =>
         {
-            var packages = PackageDirectory.GlobFiles("*.nupkg");
+            var packages = PackageFiles;
             Assert(packages.Count == 5, "packages.Count == 5");
 
             DotNetNuGetPush(_ => _
@@ -283,6 +566,8 @@ partial class Build : NukeBuild
                 degreeOfParallelism: 5,
                 completeOnFailure: true);
         });
+
+    IReadOnlyCollection<AbsolutePath> PackageFiles => PackageDirectory.GlobFiles("*.nupkg");
 
     Target Install => _ => _
         .DependsOn(Pack)
